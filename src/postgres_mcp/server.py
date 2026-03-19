@@ -12,7 +12,8 @@ from typing import Literal
 from typing import Union
 
 import mcp.types as types
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from fastmcp.tools import Tool
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from pydantic import validate_call
@@ -606,21 +607,25 @@ async def main():
     # Add the query tool with a description and annotations appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
         mcp.add_tool(
-            execute_sql,
-            description="Execute any SQL query",
-            annotations=ToolAnnotations(
-                title="Execute SQL",
-                destructiveHint=True,
-            ),
+            Tool.from_function(
+                execute_sql,
+                description="Execute any SQL query",
+                annotations=ToolAnnotations(
+                    title="Execute SQL",
+                    destructiveHint=True,
+                ),
+            )
         )
     else:
         mcp.add_tool(
-            execute_sql,
-            description="Execute a read-only SQL query",
-            annotations=ToolAnnotations(
-                title="Execute SQL (Read-Only)",
-                readOnlyHint=True,
-            ),
+            Tool.from_function(
+                execute_sql,
+                description="Execute a read-only SQL query",
+                annotations=ToolAnnotations(
+                    title="Execute SQL (Read-Only)",
+                    readOnlyHint=True,
+                ),
+            )
         )
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
@@ -658,15 +663,11 @@ async def main():
 
     # Run the server with the selected transport (always async)
     if args.transport == "stdio":
-        await mcp.run_stdio_async()
+        await mcp.run_async(transport="stdio")
     elif args.transport == "sse":
-        mcp.settings.host = args.sse_host
-        mcp.settings.port = args.sse_port
-        await mcp.run_sse_async()
+        await mcp.run_async(transport="sse", host=args.sse_host, port=args.sse_port)
     elif args.transport == "streamable-http":
-        mcp.settings.host = args.streamable_http_host
-        mcp.settings.port = args.streamable_http_port
-        await mcp.run_streamable_http_async()
+        await mcp.run_async(transport="streamable-http", host=args.streamable_http_host, port=args.streamable_http_port)
 
 
 async def shutdown(sig=None):
