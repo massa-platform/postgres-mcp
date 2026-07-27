@@ -1,18 +1,22 @@
 # ruff: noqa: B008
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
 import sys
 from enum import Enum
 from typing import Any
+from typing import Dict
 from typing import List
 from typing import Literal
+from typing import Optional
 from typing import Union
 
 import mcp.types as types
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
 from fastmcp.tools import Tool
 from mcp.types import ToolAnnotations
 from pydantic import Field
@@ -55,20 +59,66 @@ class AccessMode(str, Enum):
 
 
 # Global variables
-db_connection = DbConnPool()
+db_connections: Dict[str, DbConnPool] = {}
+default_connection_name: Optional[str] = None
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
 
 
+def get_connection_name() -> str:
+    """Get connection name from MCP headers or return default.
+
+    This function attempts to read the X-Postgres-Connection header from
+    the HTTP request. If the header is present and specifies a valid
+    connection, that connection name is returned. Otherwise, the default
+    connection is used.
+
+    For stdio transport (which doesn't support HTTP headers), this will
+    always return the default connection.
+
+    Returns:
+        str: The name of the connection to use
+
+    Raises:
+        ValueError: If no default connection is configured
+    """
+    try:
+        # Attempt to get HTTP headers (only works with HTTP transports)
+        headers = get_http_headers()
+        conn_name = headers.get("x-postgres-connection")
+
+        if conn_name and conn_name in db_connections:
+            logger.debug(f"Using connection from header: {conn_name}")
+            return conn_name
+        elif conn_name:
+            logger.warning(f"Unknown connection requested: {conn_name}, using default: {default_connection_name}")
+    except Exception as e:
+        # This is expected for stdio transport - no HTTP headers available
+        logger.debug(f"Could not read HTTP headers (expected for stdio transport): {e}")
+
+    # Fall back to default connection
+    if default_connection_name is None:
+        raise ValueError("No default connection configured")
+
+    logger.debug(f"Using default connection: {default_connection_name}")
+    return default_connection_name
+
+
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
-    """Get the appropriate SQL driver based on the current access mode."""
+    """Get the appropriate SQL driver based on the current access mode and selected connection."""
+    conn_name = get_connection_name()
+
+    if conn_name not in db_connections:
+        raise ValueError(f"Unknown connection: {conn_name}. Available connections: {list(db_connections.keys())}")
+
+    db_connection = db_connections[conn_name]
     base_driver = SqlDriver(conn=db_connection)
 
     if current_access_mode == AccessMode.RESTRICTED:
-        logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
+        logger.debug(f"Using SafeSqlDriver with restrictions (RESTRICTED mode) for connection: {conn_name}")
         return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
     else:
-        logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
+        logger.debug(f"Using unrestricted SqlDriver (UNRESTRICTED mode) for connection: {conn_name}")
         return base_driver
 
 
@@ -555,10 +605,71 @@ async def get_top_queries(
         return format_error_response(str(e))
 
 
+def parse_database_connections(args) -> Dict[str, Dict[str, str]]:
+    """Parse database connection configuration from environment variables or command line.
+
+    This function supports multiple methods of configuration:
+    1. DATABASE_URIS environment variable with JSON: {"conn1": "url1", "conn2": "url2"}
+    2. Multiple DATABASE_URI_* environment variables: DATABASE_URI_PRIMARY, DATABASE_URI_ANALYTICS, etc.
+    3. Single DATABASE_URI environment variable (backward compatibility)
+    4. Command line argument (backward compatibility)
+
+    Returns:
+        Dict mapping connection names to their configuration
+        Format: {"connection_name": {"url": "postgresql://..."}, ...}
+
+    Raises:
+        ValueError: If no database connections are configured
+    """
+    connections: Dict[str, Dict[str, str]] = {}
+
+    # Method 1: Try DATABASE_URIS JSON environment variable
+    database_uris_json = os.environ.get("DATABASE_URIS")
+    if database_uris_json:
+        try:
+            parsed_uris = json.loads(database_uris_json)
+            if isinstance(parsed_uris, dict):
+                for name, url in parsed_uris.items():
+                    connections[name] = {"url": url}
+                logger.info(f"Loaded {len(connections)} connections from DATABASE_URIS")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse DATABASE_URIS JSON: {e}")
+            raise ValueError(f"Invalid JSON in DATABASE_URIS: {e}")
+
+    # Method 2: Try DATABASE_URI_* environment variables
+    if not connections:
+        for key, value in os.environ.items():
+            if key.startswith("DATABASE_URI_") and len(key) > len("DATABASE_URI_"):
+                # Extract connection name from DATABASE_URI_PRIMARY -> primary
+                conn_name = key[len("DATABASE_URI_") :].lower()
+                connections[conn_name] = {"url": value}
+
+        if connections:
+            logger.info(f"Loaded {len(connections)} connections from DATABASE_URI_* environment variables")
+
+    # Method 3: Try single DATABASE_URI (backward compatibility)
+    if not connections:
+        database_uri = os.environ.get("DATABASE_URI", args.database_url)
+        if database_uri:
+            connections["default"] = {"url": database_uri}
+            logger.info("Loaded single connection from DATABASE_URI or command line argument")
+
+    if not connections:
+        raise ValueError(
+            "No database connections configured. Please provide:\n"
+            "  - DATABASE_URIS environment variable with JSON, OR\n"
+            "  - DATABASE_URI_* environment variables (e.g., DATABASE_URI_PRIMARY), OR\n"
+            "  - DATABASE_URI environment variable, OR\n"
+            "  - database_url command line argument"
+        )
+
+    return connections
+
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
-    parser.add_argument("database_url", help="Database connection URL", nargs="?")
+    parser.add_argument("database_url", help="Database connection URL (deprecated, use DATABASE_URI instead)", nargs="?")
     parser.add_argument(
         "--access-mode",
         type=str,
@@ -630,25 +741,44 @@ async def main():
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 
-    # Get database URL from environment variable or command line
-    database_url = os.environ.get("DATABASE_URI", args.database_url)
+    # Parse database connections from environment variables or command line
+    connections_config = parse_database_connections(args)
 
-    if not database_url:
+    # Initialize all database connection pools
+    global db_connections, default_connection_name
+    successful_connections = 0
+    failed_connections = []
+
+    for conn_name, config in connections_config.items():
+        try:
+            pool = DbConnPool()
+            await pool.pool_connect(config["url"])
+            db_connections[conn_name] = pool
+            successful_connections += 1
+            logger.info(f"Successfully connected to database '{conn_name}'")
+        except Exception as e:
+            failed_connections.append(conn_name)
+            logger.warning(f"Could not connect to database '{conn_name}': {obfuscate_password(str(e))}")
+
+    if successful_connections == 0:
         raise ValueError(
-            "Error: No database URL provided. Please specify via 'DATABASE_URI' environment variable or command-line argument.",
+            "Failed to connect to any configured databases. "
+            "The MCP server cannot start without at least one valid database connection."
         )
 
-    # Initialize database connection pool
-    try:
-        await db_connection.pool_connect(database_url)
-        logger.info("Successfully connected to database and initialized connection pool")
-    except Exception as e:
-        logger.warning(
-            f"Could not connect to database: {obfuscate_password(str(e))}",
-        )
-        logger.warning(
-            "The MCP server will start but database operations will fail until a valid connection is established.",
-        )
+    if failed_connections:
+        logger.warning(f"Failed to connect to {len(failed_connections)} database(s): {', '.join(failed_connections)}")
+        logger.warning(f"Server will start with {successful_connections} available connection(s)")
+
+    # Set default connection
+    # Priority: 1. "default" connection if exists, 2. first connection in dict
+    if "default" in db_connections:
+        default_connection_name = "default"
+    else:
+        default_connection_name = list(db_connections.keys())[0]
+
+    logger.info(f"Default connection: {default_connection_name}")
+    logger.info(f"Available connections: {', '.join(db_connections.keys())}")
 
     # Set up proper shutdown handling
     try:
@@ -684,12 +814,17 @@ async def shutdown(sig=None):
     if sig:
         logger.info(f"Received exit signal {sig.name}")
 
-    # Close database connections
-    try:
-        await db_connection.close()
-        logger.info("Closed database connections")
-    except Exception as e:
-        logger.error(f"Error closing database connections: {e}")
+    # Close all database connections
+    if db_connections:
+        logger.info(f"Closing {len(db_connections)} database connection(s)...")
+        for conn_name, conn in db_connections.items():
+            try:
+                await conn.close()
+                logger.info(f"Closed database connection: {conn_name}")
+            except Exception as e:
+                logger.error(f"Error closing database connection '{conn_name}': {e}")
+    else:
+        logger.info("No database connections to close")
 
     # Exit with appropriate status code
     sys.exit(128 + sig if sig is not None else 0)
