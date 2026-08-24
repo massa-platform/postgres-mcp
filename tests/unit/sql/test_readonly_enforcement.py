@@ -28,7 +28,8 @@ async def test_force_readonly_enforcement():
     # Test UNRESTRICTED mode
     with (
         patch("postgres_mcp.server.current_access_mode", AccessMode.UNRESTRICTED),
-        patch("postgres_mcp.server.db_connection", mock_conn_pool),
+        patch.dict("postgres_mcp.server.db_connections", {"default": mock_conn_pool}, clear=True),
+        patch("postgres_mcp.server.default_connection_name", "default"),
         patch.object(SqlDriver, "_execute_with_connection", mock_execute),
     ):
         driver = await get_sql_driver()
@@ -59,7 +60,8 @@ async def test_force_readonly_enforcement():
     # Test RESTRICTED mode
     with (
         patch("postgres_mcp.server.current_access_mode", AccessMode.RESTRICTED),
-        patch("postgres_mcp.server.db_connection", mock_conn_pool),
+        patch.dict("postgres_mcp.server.db_connections", {"default": mock_conn_pool}, clear=True),
+        patch("postgres_mcp.server.default_connection_name", "default"),
         patch.object(SqlDriver, "_execute_with_connection", mock_execute),
     ):
         driver = await get_sql_driver()

@@ -66,42 +66,38 @@ shutdown_in_progress = False
 
 
 def get_connection_name() -> str:
-    """Get connection name from MCP headers or return default.
+    """Resolve which named connection this request may use.
 
-    This function attempts to read the X-Postgres-Connection header from
-    the HTTP request. If the header is present and specifies a valid
-    connection, that connection name is returned. Otherwise, the default
-    connection is used.
-
-    For stdio transport (which doesn't support HTTP headers), this will
-    always return the default connection.
-
-    Returns:
-        str: The name of the connection to use
-
-    Raises:
-        ValueError: If no default connection is configured
+    Fail-closed: an unknown X-Postgres-Connection value is always an error,
+    and a missing header is an error unless an unambiguous default exists
+    (single-connection deployments, stdio included). A request is never
+    silently routed to a database other than the one it named.
     """
+    conn_name = None
     try:
-        # Attempt to get HTTP headers (only works with HTTP transports)
         headers = get_http_headers()
         conn_name = headers.get("x-postgres-connection")
-
-        if conn_name and conn_name in db_connections:
-            logger.debug(f"Using connection from header: {conn_name}")
-            return conn_name
-        elif conn_name:
-            logger.warning(f"Unknown connection requested: {conn_name}, using default: {default_connection_name}")
     except Exception as e:
-        # This is expected for stdio transport - no HTTP headers available
+        # Expected for stdio transport - no HTTP headers available
         logger.debug(f"Could not read HTTP headers (expected for stdio transport): {e}")
 
-    # Fall back to default connection
-    if default_connection_name is None:
-        raise ValueError("No default connection configured")
+    if conn_name:
+        if conn_name in db_connections:
+            logger.debug(f"Using connection from header: {conn_name}")
+            return conn_name
+        raise ValueError(
+            f"Unknown connection '{conn_name}'. "
+            f"Configured connections: {sorted(db_connections.keys())}"
+        )
 
-    logger.debug(f"Using default connection: {default_connection_name}")
-    return default_connection_name
+    if default_connection_name is not None:
+        logger.debug(f"Using default connection: {default_connection_name}")
+        return default_connection_name
+
+    raise ValueError(
+        "No connection selected: the X-Postgres-Connection header is required "
+        f"when multiple connections are configured ({sorted(db_connections.keys())})"
+    )   
 
 
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
@@ -770,12 +766,20 @@ async def main():
         logger.warning(f"Failed to connect to {len(failed_connections)} database(s): {', '.join(failed_connections)}")
         logger.warning(f"Server will start with {successful_connections} available connection(s)")
 
-    # Set default connection
-    # Priority: 1. "default" connection if exists, 2. first connection in dict
+    # Fail-closed default policy: a default exists only when it is unambiguous -
+    # exactly one configured connection, or a connection explicitly named "default".
+    # With multiple connections and no explicit default, every request must carry
+    # X-Postgres-Connection; get_connection_name() rejects anything else.
     if "default" in db_connections:
         default_connection_name = "default"
+    elif len(db_connections) == 1:
+        default_connection_name = next(iter(db_connections))
     else:
-        default_connection_name = list(db_connections.keys())[0]
+        default_connection_name = None
+        logger.info(
+            "Multiple connections configured with no explicit 'default' - "
+            "X-Postgres-Connection header is required on every request"
+        )
 
     logger.info(f"Default connection: {default_connection_name}")
     logger.info(f"Available connections: {', '.join(db_connections.keys())}")

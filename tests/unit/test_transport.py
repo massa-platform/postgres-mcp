@@ -8,7 +8,7 @@ import pytest
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["stdio", "sse", "streamable-http"])
 async def test_transport_argument_parsing(transport):
-    """Test that all transport options are parsed correctly."""
+    """Test that all transport options are parsed and passed to run_async."""
     from postgres_mcp.server import main
 
     original_argv = sys.argv
@@ -20,35 +20,21 @@ async def test_transport_argument_parsing(transport):
         ]
 
         with (
-            patch("postgres_mcp.server.db_connection.pool_connect", AsyncMock()),
-            patch("postgres_mcp.server.mcp.run_stdio_async", AsyncMock()) as mock_stdio,
-            patch("postgres_mcp.server.mcp.run_sse_async", AsyncMock()) as mock_sse,
-            patch("postgres_mcp.server.mcp.run_streamable_http_async", AsyncMock()) as mock_http,
+            patch("postgres_mcp.server.DbConnPool.pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.mcp.run_async", AsyncMock()) as mock_run,
         ):
             await main()
 
-            # Verify the correct transport method was called
-            if transport == "stdio":
-                mock_stdio.assert_called_once()
-                mock_sse.assert_not_called()
-                mock_http.assert_not_called()
-            elif transport == "sse":
-                mock_stdio.assert_not_called()
-                mock_sse.assert_called_once()
-                mock_http.assert_not_called()
-            elif transport == "streamable-http":
-                mock_stdio.assert_not_called()
-                mock_sse.assert_not_called()
-                mock_http.assert_called_once()
+            mock_run.assert_called_once()
+            assert mock_run.call_args.kwargs["transport"] == transport
     finally:
         sys.argv = original_argv
 
 
 @pytest.mark.asyncio
 async def test_streamable_http_host_port_arguments():
-    """Test that streamable-http host and port arguments are applied correctly."""
+    """Test that streamable-http host and port arguments are passed to run_async."""
     from postgres_mcp.server import main
-    from postgres_mcp.server import mcp
 
     original_argv = sys.argv
     try:
@@ -61,23 +47,23 @@ async def test_streamable_http_host_port_arguments():
         ]
 
         with (
-            patch("postgres_mcp.server.db_connection.pool_connect", AsyncMock()),
-            patch("postgres_mcp.server.mcp.run_streamable_http_async", AsyncMock()),
+            patch("postgres_mcp.server.DbConnPool.pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.mcp.run_async", AsyncMock()) as mock_run,
         ):
             await main()
 
-            # Verify the host and port were set correctly
-            assert mcp.settings.host == "0.0.0.0"
-            assert mcp.settings.port == 9000
+            kwargs = mock_run.call_args.kwargs
+            assert kwargs["transport"] == "streamable-http"
+            assert kwargs["host"] == "0.0.0.0"
+            assert kwargs["port"] == 9000
     finally:
         sys.argv = original_argv
 
 
 @pytest.mark.asyncio
 async def test_sse_host_port_arguments():
-    """Test that SSE host and port arguments are applied correctly."""
+    """Test that SSE host and port arguments are passed to run_async."""
     from postgres_mcp.server import main
-    from postgres_mcp.server import mcp
 
     original_argv = sys.argv
     try:
@@ -90,14 +76,15 @@ async def test_sse_host_port_arguments():
         ]
 
         with (
-            patch("postgres_mcp.server.db_connection.pool_connect", AsyncMock()),
-            patch("postgres_mcp.server.mcp.run_sse_async", AsyncMock()),
+            patch("postgres_mcp.server.DbConnPool.pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.mcp.run_async", AsyncMock()) as mock_run,
         ):
             await main()
 
-            # Verify the host and port were set correctly
-            assert mcp.settings.host == "0.0.0.0"
-            assert mcp.settings.port == 8080
+            kwargs = mock_run.call_args.kwargs
+            assert kwargs["transport"] == "sse"
+            assert kwargs["host"] == "0.0.0.0"
+            assert kwargs["port"] == 8080
     finally:
         sys.argv = original_argv
 
@@ -115,15 +102,11 @@ async def test_default_transport_is_stdio():
         ]
 
         with (
-            patch("postgres_mcp.server.db_connection.pool_connect", AsyncMock()),
-            patch("postgres_mcp.server.mcp.run_stdio_async", AsyncMock()) as mock_stdio,
-            patch("postgres_mcp.server.mcp.run_sse_async", AsyncMock()) as mock_sse,
-            patch("postgres_mcp.server.mcp.run_streamable_http_async", AsyncMock()) as mock_http,
+            patch("postgres_mcp.server.DbConnPool.pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.mcp.run_async", AsyncMock()) as mock_run,
         ):
             await main()
 
-            mock_stdio.assert_called_once()
-            mock_sse.assert_not_called()
-            mock_http.assert_not_called()
+            assert mock_run.call_args.kwargs["transport"] == "stdio"
     finally:
         sys.argv = original_argv
