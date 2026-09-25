@@ -1,11 +1,22 @@
 # ruff: noqa: B008
 import argparse
 import asyncio
+import base64
+import hmac
 import json
 import logging
+import math
 import os
 import signal
 import sys
+import time
+import uuid
+from datetime import date
+from datetime import datetime
+from datetime import time as dt_time
+from datetime import timedelta
+from datetime import timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 from typing import Dict
@@ -15,12 +26,19 @@ from typing import Optional
 from typing import Union
 
 import mcp.types as types
+import pglast
+import psycopg
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.tools import Tool
 from mcp.types import ToolAnnotations
+from pglast.ast import RawStmt
+from pglast.ast import SelectStmt
 from pydantic import Field
 from pydantic import validate_call
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.responses import Response
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
@@ -46,6 +64,16 @@ mcp = FastMCP("postgres-mcp")
 PG_STAT_STATEMENTS = "pg_stat_statements"
 HYPOPG_EXTENSION = "hypopg"
 
+# /internal/query: shared secret header the gateway must present, and the
+# default row cap (override with POSTGRES_MCP_MAX_ROWS).
+GATEWAY_SECRET_ENV = "GATEWAY_SECRET"
+MAX_ROWS_ENV = "POSTGRES_MCP_MAX_ROWS"
+DEFAULT_MAX_ROWS = 10000
+INTERNAL_QUERY_TIMEOUT_SECONDS = 30
+INTERNAL_QUERY_MAX_BODY_BYTES = 1024 * 1024
+# Longest statement/error text that is logged or echoed back.
+LOG_TEXT_MAX_CHARS = 2048
+
 ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
 
 logger = logging.getLogger(__name__)
@@ -66,12 +94,10 @@ shutdown_in_progress = False
 
 
 def get_connection_name() -> str:
-    """Resolve which named connection this request may use.
+    """Resolve which named connection the current MCP request may use.
 
-    Fail-closed: an unknown X-Postgres-Connection value is always an error,
-    and a missing header is an error unless an unambiguous default exists
-    (single-connection deployments, stdio included). A request is never
-    silently routed to a database other than the one it named.
+    Reads X-Postgres-Connection from the MCP request context, then applies
+    resolve_connection_name().
     """
     conn_name = None
     try:
@@ -81,6 +107,17 @@ def get_connection_name() -> str:
         # Expected for stdio transport - no HTTP headers available
         logger.debug(f"Could not read HTTP headers (expected for stdio transport): {e}")
 
+    return resolve_connection_name(conn_name)
+
+
+def resolve_connection_name(conn_name: Optional[str]) -> str:
+    """Resolve a connection name from a header value (or its absence).
+
+    Fail-closed: an unknown X-Postgres-Connection value is always an error,
+    and a missing header is an error unless an unambiguous default exists
+    (single-connection deployments, stdio included). A request is never
+    silently routed to a database other than the one it named.
+    """
     if conn_name:
         if conn_name in db_connections:
             logger.debug(f"Using connection from header: {conn_name}")
@@ -97,7 +134,7 @@ def get_connection_name() -> str:
     raise ValueError(
         "No connection selected: the X-Postgres-Connection header is required "
         f"when multiple connections are configured ({sorted(db_connections.keys())})"
-    )   
+    )
 
 
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
@@ -599,6 +636,211 @@ async def get_top_queries(
     except Exception as e:
         logger.error(f"Error getting slow queries: {e}")
         return format_error_response(str(e))
+
+
+# ---------------------------------------------------------------------------
+# /internal/query - non-MCP HTTP route used by the gateway for Grafana panels
+# ---------------------------------------------------------------------------
+
+
+def json_safe(value: Any) -> Any:
+    """Convert a database cell into something json.dumps accepts.
+
+    Rules (see SPEC-grafana-user-access §3.2):
+      Decimal   -> number when the JSON literal round-trips to the same value
+                   (i.e. repr(float(d)) parses back to d), else string. NaN/inf -> string.
+      datetime  -> ISO 8601 in UTC with a trailing Z (naive values are taken as UTC)
+      date      -> midnight UTC, same shape, so Grafana parses it as a time
+      time      -> isoformat
+      timedelta -> total seconds (number)
+      bytes     -> base64
+      UUID      -> string
+      None      -> null
+    Lists and dicts are converted element-wise; anything else falls back to str().
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return str(value)
+        as_float = float(value)
+        if math.isfinite(as_float) and Decimal(repr(as_float)) == value:
+            return as_float
+        return str(value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        value = value.astimezone(timezone.utc)
+        return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return f"{value.isoformat()}T00:00:00Z"
+    if isinstance(value, dt_time):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [json_safe(v) for v in value]
+    return str(value)
+
+
+def gateway_secret_matches(provided: Optional[str]) -> bool:
+    """Constant-time comparison of X-Gateway-Secret against GATEWAY_SECRET.
+
+    A missing GATEWAY_SECRET env var means the route is unusable: nothing is
+    accepted, rather than everything.
+    """
+    expected = os.environ.get(GATEWAY_SECRET_ENV)
+    if not expected or not provided:
+        return False
+    return hmac.compare_digest(expected.encode("utf-8"), provided.encode("utf-8"))
+
+
+def internal_query_max_rows() -> int:
+    raw = os.environ.get(MAX_ROWS_ENV)
+    if not raw:
+        return DEFAULT_MAX_ROWS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(f"{MAX_ROWS_ENV}={raw!r} is not an integer; using {DEFAULT_MAX_ROWS}")
+        return DEFAULT_MAX_ROWS
+    return parsed if parsed > 0 else DEFAULT_MAX_ROWS
+
+
+def prepare_internal_sql(sql: str, max_rows: int) -> str:
+    """Accept exactly one SELECT and wrap it so Postgres applies the row cap.
+
+    The route exists for dashboard panels, so anything that is not a single
+    SELECT (SHOW, PREPARE, DECLARE, multiple statements, ...) is refused here
+    before SafeSqlDriver sees it. Wrapping in a subquery with LIMIT max_rows+1
+    means the cap is enforced by Postgres rather than by fetching everything
+    and slicing; the +1 is how truncation is detected. The trailing newline
+    keeps a final ``-- comment`` from swallowing the wrapper.
+    """
+    try:
+        statements = pglast.parse_sql(sql)
+    except pglast.parser.ParseError as e:
+        raise ValueError("Failed to parse SQL statement") from e
+    if len(statements) != 1:
+        raise ValueError("Exactly one SELECT statement is allowed")
+    raw = statements[0]
+    stmt = raw.stmt if isinstance(raw, RawStmt) else raw
+    if not isinstance(stmt, SelectStmt):
+        raise ValueError("Only SELECT statements are allowed")
+    # Slice the statement text by the parser's own offsets so a trailing ';'
+    # or ';  -- comment' cannot end up inside the subquery.
+    start = getattr(raw, "stmt_location", 0) or 0
+    length = getattr(raw, "stmt_len", 0) or 0
+    inner = (sql[start : start + length] if length else sql[start:]).strip()
+    return f"SELECT * FROM (\n{inner}\n) AS massa_q LIMIT {max_rows + 1}"
+
+
+# SQLSTATE classes whose primary message is about the statement itself and
+# safe to show a dashboard user. Everything else (connection, auth, resource,
+# internal) gets a fixed message; the detail stays in the log.
+_CLIENT_VISIBLE_SQLSTATE_CLASSES = {"22", "2F", "42", "0A", "P0", "3F", "44", "21", "23", "24", "25", "2B", "2D", "39", "3B", "3D", "40", "57"}
+
+
+def client_error_message(e: Exception) -> str:
+    """Message for the 400 body: never a DSN, host, IP or login name."""
+    if isinstance(e, psycopg.Error) and not isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError)):
+        sqlstate = e.sqlstate or ""
+        primary = getattr(getattr(e, "diag", None), "message_primary", None)
+        if sqlstate[:2] in _CLIENT_VISIBLE_SQLSTATE_CLASSES:
+            # diag.message_primary needs a server result; fall back to the first line of str(e).
+            text = primary or (str(e).splitlines() or [""])[0]
+            return (obfuscate_password(text) or "query failed")[:LOG_TEXT_MAX_CHARS]
+        return "query failed"
+    if isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError)):
+        return "query failed"
+    if isinstance(e, ValueError):
+        # SafeSqlDriver / prepare_internal_sql: statement-level verdicts.
+        return (obfuscate_password(str(e)) or "query failed")[:LOG_TEXT_MAX_CHARS]
+    return "query failed"
+
+
+@mcp.custom_route("/internal/query", methods=["POST"], include_in_schema=False)
+async def internal_query(request: Request) -> Response:
+    """Run one read-only SQL statement on a named connection and return rows as JSON.
+
+    Not an MCP tool: the model never sees it. The gateway calls it for Grafana
+    panel queries after resolving the user's permissions to a connection.
+
+    Headers: X-Gateway-Secret (must equal GATEWAY_SECRET), X-Postgres-Connection.
+    Body:    {"sql": "<text>"}
+    200:     {"columns": [...], "rows": [{...}], "truncated": true?}
+    400:     {"error": "<message>"}   401: bad/missing secret
+    Always SafeSqlDriver, regardless of --access-mode.
+    """
+    if not gateway_secret_matches(request.headers.get("x-gateway-secret")):
+        logger.warning("internal/query: missing or invalid gateway secret")
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        conn_name = resolve_connection_name(request.headers.get("x-postgres-connection"))
+    except ValueError as e:
+        # The exception text lists configured connections; keep that in the log only.
+        logger.warning(f"internal/query: connection not resolved: {e}")
+        return JSONResponse({"error": "unknown or unselected connection"}, status_code=400)
+
+    # Body cap: Content-Length up front, then counted while streaming so a
+    # chunked body cannot bypass it.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > INTERNAL_QUERY_MAX_BODY_BYTES:
+        return JSONResponse({"error": "body too large"}, status_code=413)
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > INTERNAL_QUERY_MAX_BODY_BYTES:
+            return JSONResponse({"error": "body too large"}, status_code=413)
+    try:
+        body = json.loads(bytes(raw))
+    except Exception:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    sql = body.get("sql") if isinstance(body, dict) else None
+    if not isinstance(sql, str) or not sql.strip():
+        return JSONResponse({"error": 'body must be {"sql": "<text>"}'}, status_code=400)
+
+    max_rows = internal_query_max_rows()
+    started = time.monotonic()
+    try:
+        wrapped = prepare_internal_sql(sql, max_rows)
+        driver = SafeSqlDriver(sql_driver=SqlDriver(conn=db_connections[conn_name]), timeout=INTERNAL_QUERY_TIMEOUT_SECONDS)
+        rows = await driver.execute_query(wrapped)  # type: ignore[arg-type]
+    except Exception as e:
+        detail = (obfuscate_password(str(e)) or repr(e))[:LOG_TEXT_MAX_CHARS]
+        logger.warning(f"internal/query: connection='{conn_name}' failed after {(time.monotonic() - started) * 1000:.0f}ms: {detail}")
+        return JSONResponse({"error": client_error_message(e)}, status_code=400)
+
+    rows = rows or []
+    truncated = len(rows) > max_rows
+    if truncated:
+        rows = rows[:max_rows]
+
+    try:
+        columns = list(rows[0].cells.keys()) if rows else []
+        payload: Dict[str, Any] = {
+            "columns": columns,
+            "rows": [{str(k): json_safe(v) for k, v in row.cells.items()} for row in rows],
+        }
+    except Exception as e:
+        logger.warning(f"internal/query: connection='{conn_name}' result could not be serialized: {e!r}")
+        return JSONResponse({"error": "result could not be serialized"}, status_code=400)
+    if truncated:
+        payload["truncated"] = True
+
+    logger.info(
+        f"internal/query: connection='{conn_name}' rows={len(rows)} truncated={truncated} duration_ms={(time.monotonic() - started) * 1000:.0f}"
+    )
+    return JSONResponse(payload)
 
 
 def parse_database_connections(args) -> Dict[str, Dict[str, str]]:

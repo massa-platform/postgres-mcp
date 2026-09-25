@@ -120,6 +120,9 @@ class SafeSqlDriver(SqlDriver):
     }
 
     ALLOWED_FUNCTIONS: ClassVar[set[str]] = {
+        # Read-only helpers dashboards rely on for time buckets and gap filling.
+        "generate_series",
+        "date_bin",
         # Aggregate functions
         "array_agg",
         "avg",
@@ -929,21 +932,22 @@ class SafeSqlDriver(SqlDriver):
                 # Skip attributes that don't exist (this is normal in pglast)
                 continue
 
-            # Handle lists of nodes
-            if isinstance(attr, list):
-                for item in attr:
-                    if isinstance(item, Node):
-                        self._validate_node(item)
+            self._validate_child(attr)
 
-            # Handle tuples of nodes
-            elif isinstance(attr, tuple):
-                for item in attr:
-                    if isinstance(item, Node):
-                        self._validate_node(item)
+    def _validate_child(self, value: Any) -> None:
+        """Validate a node attribute of any shape.
 
-            # Handle single nodes
-            elif isinstance(attr, Node):
-                self._validate_node(attr)
+        pglast nests some children more than one level deep - a FROM-clause
+        function is ``RangeFunction.functions = ((FuncCall, None), ...)`` and a
+        VALUES list is ``SelectStmt.valuesLists = ((expr, ...), ...)``. Walking
+        only one level would skip every FuncCall in those positions and let
+        ``SELECT * FROM pg_sleep(30)`` past the function allowlist.
+        """
+        if isinstance(value, Node):
+            self._validate_node(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                self._validate_child(item)
 
     def _validate(self, query: str) -> None:
         """Validate query is safe to execute"""
@@ -972,7 +976,10 @@ class SafeSqlDriver(SqlDriver):
                             )
                     self._validate_node(stmt)
             except Exception as e:
-                raise ValueError(f"Error validating query: {query}") from e
+                # Echo at most 2 KB of the statement: this text is logged and
+                # can be returned to callers.
+                shown = query if len(query) <= 2048 else query[:2048] + "..."
+                raise ValueError(f"Error validating query: {shown}") from e
 
         except pglast.parser.ParseError as e:
             raise ValueError("Failed to parse SQL statement") from e

@@ -1,5 +1,6 @@
 """SQL driver adapter for PostgreSQL connections."""
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Optional
 from urllib.parse import urlparse
 from urllib.parse import urlunparse
 
+import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString
@@ -67,6 +69,7 @@ class DbConnPool:
         self.pool: AsyncConnectionPool | None = None
         self._is_valid = False
         self._last_error = None
+        self._connect_lock: asyncio.Lock | None = None
 
     async def pool_connect(self, connection_url: Optional[str] = None) -> AsyncConnectionPool:
         """Initialize connection pool with retry logic."""
@@ -74,6 +77,16 @@ class DbConnPool:
         if self.pool and self._is_valid:
             return self.pool
 
+        # Serialise (re)builds: concurrent callers after an invalidation must
+        # share one new pool, not each open their own and orphan the rest.
+        if self._connect_lock is None:
+            self._connect_lock = asyncio.Lock()
+        async with self._connect_lock:
+            if self.pool and self._is_valid:
+                return self.pool
+            return await self._pool_connect_locked(connection_url)
+
+    async def _pool_connect_locked(self, connection_url: Optional[str]) -> AsyncConnectionPool:
         url = connection_url or self.connection_url
         self.connection_url = url
         if not url:
@@ -212,12 +225,17 @@ class SqlDriver:
                 # Direct connection approach
                 return await self._execute_with_connection(self.conn, query, params, force_readonly=force_readonly)
         except Exception as e:
-            # Mark pool as invalid if there was a connection issue
-            if self.conn and self.is_pool:
-                self.conn._is_valid = False  # type: ignore
-                self.conn._last_error = str(e)  # type: ignore
-            elif self.conn and not self.is_pool:
-                self.conn = None
+            # Mark the pool invalid ONLY for connection-level failures. A
+            # syntax error or "permission denied" is the statement's problem,
+            # not the pool's; invalidating on those made every bad query tear
+            # the pool down and rebuild it (and concurrent callers could each
+            # build their own, orphaning the others).
+            if isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError)):
+                if self.conn and self.is_pool:
+                    self.conn._is_valid = False  # type: ignore
+                    self.conn._last_error = str(e)  # type: ignore
+                elif self.conn and not self.is_pool:
+                    self.conn = None
 
             raise e
 
@@ -268,5 +286,6 @@ class SqlDriver:
                 except Exception as rollback_error:
                     logger.error(f"Error rolling back transaction: {rollback_error}")
 
-            logger.error(f"Error executing query ({query}): {e}")
+            shown = query if len(query) <= 2048 else query[:2048] + "..."
+            logger.error(f"Error executing query ({shown}): {e}")
             raise e
