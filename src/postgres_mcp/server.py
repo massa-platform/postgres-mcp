@@ -26,10 +26,14 @@ from typing import Optional
 from typing import Union
 
 import mcp.types as types
+import pglast
+import psycopg
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.tools import Tool
 from mcp.types import ToolAnnotations
+from pglast.ast import RawStmt
+from pglast.ast import SelectStmt
 from pydantic import Field
 from pydantic import validate_call
 from starlette.requests import Request
@@ -66,6 +70,9 @@ GATEWAY_SECRET_ENV = "GATEWAY_SECRET"
 MAX_ROWS_ENV = "POSTGRES_MCP_MAX_ROWS"
 DEFAULT_MAX_ROWS = 10000
 INTERNAL_QUERY_TIMEOUT_SECONDS = 30
+INTERNAL_QUERY_MAX_BODY_BYTES = 1024 * 1024
+# Longest statement/error text that is logged or echoed back.
+LOG_TEXT_MAX_CHARS = 2048
 
 ResponseType = List[types.TextContent | types.ImageContent | types.EmbeddedResource]
 
@@ -708,6 +715,53 @@ def internal_query_max_rows() -> int:
     return parsed if parsed > 0 else DEFAULT_MAX_ROWS
 
 
+def prepare_internal_sql(sql: str, max_rows: int) -> str:
+    """Accept exactly one SELECT and wrap it so Postgres applies the row cap.
+
+    The route exists for dashboard panels, so anything that is not a single
+    SELECT (SHOW, PREPARE, DECLARE, multiple statements, ...) is refused here
+    before SafeSqlDriver sees it. Wrapping in a subquery with LIMIT max_rows+1
+    means the cap is enforced by Postgres rather than by fetching everything
+    and slicing; the +1 is how truncation is detected. The trailing newline
+    keeps a final ``-- comment`` from swallowing the wrapper.
+    """
+    try:
+        statements = pglast.parse_sql(sql)
+    except pglast.parser.ParseError as e:
+        raise ValueError("Failed to parse SQL statement") from e
+    if len(statements) != 1:
+        raise ValueError("Exactly one SELECT statement is allowed")
+    stmt = statements[0].stmt if isinstance(statements[0], RawStmt) else statements[0]
+    if not isinstance(stmt, SelectStmt):
+        raise ValueError("Only SELECT statements are allowed")
+    inner = sql.strip().rstrip(";").strip()
+    return f"SELECT * FROM (\n{inner}\n) AS massa_q LIMIT {max_rows + 1}"
+
+
+# SQLSTATE classes whose primary message is about the statement itself and
+# safe to show a dashboard user. Everything else (connection, auth, resource,
+# internal) gets a fixed message; the detail stays in the log.
+_CLIENT_VISIBLE_SQLSTATE_CLASSES = {"22", "2F", "42", "0A", "P0", "3F", "44", "21", "23", "24", "25", "2B", "2D", "39", "3B", "3D", "40", "57"}
+
+
+def client_error_message(e: Exception) -> str:
+    """Message for the 400 body: never a DSN, host, IP or login name."""
+    if isinstance(e, psycopg.Error) and not isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError)):
+        sqlstate = e.sqlstate or ""
+        primary = getattr(getattr(e, "diag", None), "message_primary", None)
+        if sqlstate[:2] in _CLIENT_VISIBLE_SQLSTATE_CLASSES:
+            # diag.message_primary needs a server result; fall back to the first line of str(e).
+            text = primary or (str(e).splitlines() or [""])[0]
+            return (obfuscate_password(text) or "query failed")[:LOG_TEXT_MAX_CHARS]
+        return "query failed"
+    if isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError)):
+        return "query failed"
+    if isinstance(e, ValueError):
+        # SafeSqlDriver / prepare_internal_sql: statement-level verdicts.
+        return (obfuscate_password(str(e)) or "query failed")[:LOG_TEXT_MAX_CHARS]
+    return "query failed"
+
+
 @mcp.custom_route("/internal/query", methods=["POST"], include_in_schema=False)
 async def internal_query(request: Request) -> Response:
     """Run one read-only SQL statement on a named connection and return rows as JSON.
@@ -732,35 +786,49 @@ async def internal_query(request: Request) -> Response:
         logger.warning(f"internal/query: connection not resolved: {e}")
         return JSONResponse({"error": "unknown or unselected connection"}, status_code=400)
 
+    # Body cap: Content-Length up front, then counted while streaming so a
+    # chunked body cannot bypass it.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > INTERNAL_QUERY_MAX_BODY_BYTES:
+        return JSONResponse({"error": "body too large"}, status_code=413)
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > INTERNAL_QUERY_MAX_BODY_BYTES:
+            return JSONResponse({"error": "body too large"}, status_code=413)
     try:
-        body = await request.json()
+        body = json.loads(bytes(raw))
     except Exception:
         return JSONResponse({"error": "body must be JSON"}, status_code=400)
     sql = body.get("sql") if isinstance(body, dict) else None
     if not isinstance(sql, str) or not sql.strip():
         return JSONResponse({"error": 'body must be {"sql": "<text>"}'}, status_code=400)
 
-    driver = SafeSqlDriver(sql_driver=SqlDriver(conn=db_connections[conn_name]), timeout=INTERNAL_QUERY_TIMEOUT_SECONDS)
-
+    max_rows = internal_query_max_rows()
     started = time.monotonic()
     try:
-        rows = await driver.execute_query(sql)  # type: ignore[arg-type]
+        wrapped = prepare_internal_sql(sql, max_rows)
+        driver = SafeSqlDriver(sql_driver=SqlDriver(conn=db_connections[conn_name]), timeout=INTERNAL_QUERY_TIMEOUT_SECONDS)
+        rows = await driver.execute_query(wrapped)  # type: ignore[arg-type]
     except Exception as e:
-        message = obfuscate_password(str(e)) or "query failed"
-        logger.warning(f"internal/query: connection='{conn_name}' failed after {(time.monotonic() - started) * 1000:.0f}ms: {message}")
-        return JSONResponse({"error": message}, status_code=400)
+        detail = (obfuscate_password(str(e)) or repr(e))[:LOG_TEXT_MAX_CHARS]
+        logger.warning(f"internal/query: connection='{conn_name}' failed after {(time.monotonic() - started) * 1000:.0f}ms: {detail}")
+        return JSONResponse({"error": client_error_message(e)}, status_code=400)
 
     rows = rows or []
-    max_rows = internal_query_max_rows()
     truncated = len(rows) > max_rows
     if truncated:
         rows = rows[:max_rows]
 
-    columns = list(rows[0].cells.keys()) if rows else []
-    payload: Dict[str, Any] = {
-        "columns": columns,
-        "rows": [{str(k): json_safe(v) for k, v in row.cells.items()} for row in rows],
-    }
+    try:
+        columns = list(rows[0].cells.keys()) if rows else []
+        payload: Dict[str, Any] = {
+            "columns": columns,
+            "rows": [{str(k): json_safe(v) for k, v in row.cells.items()} for row in rows],
+        }
+    except Exception as e:
+        logger.warning(f"internal/query: connection='{conn_name}' result could not be serialized: {e!r}")
+        return JSONResponse({"error": "result could not be serialized"}, status_code=400)
     if truncated:
         payload["truncated"] = True
 

@@ -8,6 +8,7 @@ is mocked.
 """
 
 import base64
+import json
 import uuid
 from datetime import date
 from datetime import datetime
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import httpx
+import psycopg
 import pytest
 import pytest_asyncio
 
@@ -323,22 +325,139 @@ def test_row_cap_env_parsing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sql_error_is_400_with_obfuscated_message(client, execute):
-    execute.side_effect = RuntimeError('connection to postgresql://p_zambia_inv:s3cr3t@db:5432/meta failed: relation "x" does not exist')
+async def test_connection_errors_never_reach_the_client(client, execute, caplog):
+    leak = 'connection to server at "meta-db.internal" (10.20.0.7), port 5432 failed: FATAL: password authentication failed for user "p_zambia_inv"'
+    execute.side_effect = psycopg.OperationalError(leak)
     r = await client.post(URL, headers=headers(), json={"sql": "SELECT * FROM x"})
     assert r.status_code == 400
-    body = r.json()
-    assert "s3cr3t" not in body["error"]
-    assert "****" in body["error"]
-    assert 'relation "x" does not exist' in body["error"]
+    assert r.json() == {"error": "query failed"}
+    # ... but the operator can still see it.
+    assert "meta-db.internal" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_permission_denied_surfaces_as_400(client, execute):
-    execute.side_effect = Exception("permission denied for table fact_gl")
+async def test_statement_errors_show_the_primary_message(client, execute):
+    execute.side_effect = psycopg.errors.InsufficientPrivilege("permission denied for table fact_gl\nDETAIL: something")
     r = await client.post(URL, headers=headers(), json={"sql": "SELECT * FROM analytics.fact_gl"})
     assert r.status_code == 400
     assert r.json() == {"error": "permission denied for table fact_gl"}
+
+    execute.side_effect = psycopg.errors.UndefinedTable('relation "analytics.nope" does not exist')
+    r = await client.post(URL, headers=headers(), json={"sql": "SELECT * FROM analytics.nope"})
+    assert r.json() == {"error": 'relation "analytics.nope" does not exist'}
+
+
+@pytest.mark.asyncio
+async def test_unknown_exception_types_are_generic(client, execute):
+    execute.side_effect = RuntimeError("postgresql://p_zambia_inv:s3cr3t@db:5432/meta exploded")
+    r = await client.post(URL, headers=headers(), json={"sql": "SELECT 1"})
+    assert r.status_code == 400
+    assert r.json() == {"error": "query failed"}
+
+
+@pytest.mark.asyncio
+async def test_validation_error_text_is_capped(client, execute):
+    sql = "SELECT " + "x" * 5000 + " FROM t; INSERT INTO t VALUES (1)"
+    r = await client.post(URL, headers=headers(), json={"sql": sql})
+    assert r.status_code == 400
+    assert len(r.json()["error"]) <= server.LOG_TEXT_MAX_CHARS
+    execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Single SELECT, wrapped with the row cap
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_internal_sql_wraps_single_select():
+    out = server.prepare_internal_sql("SELECT a FROM t ORDER BY a;", 10)
+    assert out == "SELECT * FROM (\nSELECT a FROM t ORDER BY a\n) AS massa_q LIMIT 11"
+    # trailing line comment cannot swallow the wrapper
+    out = server.prepare_internal_sql("SELECT a FROM t -- note", 10)
+    assert out.endswith("-- note\n) AS massa_q LIMIT 11")
+    # CTEs are fine inside a subquery
+    assert server.prepare_internal_sql("WITH x AS (SELECT 1 AS n) SELECT n FROM x", 5).endswith("LIMIT 6")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SHOW data_directory",
+        "PREPARE p AS SELECT 1",
+        "DECLARE c CURSOR WITH HOLD FOR SELECT 1",
+        "SELECT 1; SELECT 2",
+        "EXPLAIN SELECT 1",
+        "TABLE t; TABLE u",
+    ],
+)
+def test_prepare_internal_sql_rejects_non_single_select(sql):
+    with pytest.raises(ValueError):
+        server.prepare_internal_sql(sql, 10)
+
+
+def test_prepare_internal_sql_rejects_unparsable():
+    with pytest.raises(ValueError, match="parse"):
+        server.prepare_internal_sql("SELEC 1", 10)
+
+
+@pytest.mark.asyncio
+async def test_driver_receives_the_wrapped_statement(client, execute, monkeypatch):
+    monkeypatch.setenv(server.MAX_ROWS_ENV, "7")
+    r = await client.post(URL, headers=headers(), json={"sql": "SELECT n FROM t"})
+    assert r.status_code == 200
+    sent = execute.await_args.args[1]
+    assert "SELECT * FROM (\nSELECT n FROM t\n) AS massa_q LIMIT 8" in sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sql", ["SHOW ALL", "SELECT 1; SELECT 2", "EXPLAIN SELECT 1"])
+async def test_route_refuses_non_select_even_if_safe_sql_would_allow(client, execute, sql):
+    r = await client.post(URL, headers=headers(), json={"sql": sql})
+    assert r.status_code == 400
+    execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Body cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_body_over_cap_is_413(client, execute):
+    big = json.dumps({"sql": "SELECT '" + "x" * (server.INTERNAL_QUERY_MAX_BODY_BYTES + 10) + "'"}).encode()
+    r = await client.post(URL, headers={**headers(), "Content-Type": "application/json"}, content=big)
+    assert r.status_code == 413
+    execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chunked_body_over_cap_is_413(client, execute):
+    async def gen():
+        yield b'{"sql": "SELECT \''
+        for _ in range(20):
+            yield b"x" * 65536
+        yield b"'\"}"
+
+    r = await client.post(URL, headers={**headers(), "Content-Type": "application/json", "Transfer-Encoding": "chunked"}, content=gen())
+    assert r.status_code == 413
+    execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Serialization failure is a 400, not a 500
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unserializable_result_is_400(client, execute):
+    class Weird:
+        def __str__(self):
+            raise RuntimeError("nope")
+
+    execute.return_value = rows({"v": Weird()})
+    r = await client.post(URL, headers=headers(), json={"sql": "SELECT 1"})
+    assert r.status_code == 400
+    assert r.json() == {"error": "result could not be serialized"}
 
 
 # ---------------------------------------------------------------------------
