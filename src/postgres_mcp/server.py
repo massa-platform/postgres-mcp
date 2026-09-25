@@ -731,10 +731,15 @@ def prepare_internal_sql(sql: str, max_rows: int) -> str:
         raise ValueError("Failed to parse SQL statement") from e
     if len(statements) != 1:
         raise ValueError("Exactly one SELECT statement is allowed")
-    stmt = statements[0].stmt if isinstance(statements[0], RawStmt) else statements[0]
+    raw = statements[0]
+    stmt = raw.stmt if isinstance(raw, RawStmt) else raw
     if not isinstance(stmt, SelectStmt):
         raise ValueError("Only SELECT statements are allowed")
-    inner = sql.strip().rstrip(";").strip()
+    # Slice the statement text by the parser's own offsets so a trailing ';'
+    # or ';  -- comment' cannot end up inside the subquery.
+    start = getattr(raw, "stmt_location", 0) or 0
+    length = getattr(raw, "stmt_len", 0) or 0
+    inner = (sql[start : start + length] if length else sql[start:]).strip()
     return f"SELECT * FROM (\n{inner}\n) AS massa_q LIMIT {max_rows + 1}"
 
 

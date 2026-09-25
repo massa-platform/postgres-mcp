@@ -375,6 +375,12 @@ def test_prepare_internal_sql_wraps_single_select():
     # trailing line comment cannot swallow the wrapper
     out = server.prepare_internal_sql("SELECT a FROM t -- note", 10)
     assert out.endswith("-- note\n) AS massa_q LIMIT 11")
+    # semicolon followed by a comment (common in panel SQL)
+    out = server.prepare_internal_sql("SELECT a FROM t;  -- panel A\n", 10)
+    assert out == "SELECT * FROM (\nSELECT a FROM t\n) AS massa_q LIMIT 11"
+    # leading comment stays inside the subquery on its own line; harmless
+    out = server.prepare_internal_sql("-- header\n  SELECT 1;", 10)
+    assert out == "SELECT * FROM (\n-- header\n  SELECT 1\n) AS massa_q LIMIT 11"
     # CTEs are fine inside a subquery
     assert server.prepare_internal_sql("WITH x AS (SELECT 1 AS n) SELECT n FROM x", 5).endswith("LIMIT 6")
 
