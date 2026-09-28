@@ -555,6 +555,27 @@ Both have security weaknesses—few MCP clients store the MCP server configurati
 Both also have usability issues in some scenarios.
 
 
+### Internal Query Route (gateway only, not an MCP tool)
+
+`POST /internal/query` runs one read-only statement on a named connection and returns
+rows as JSON. It exists so the Massa gateway can serve Grafana panel queries with the
+*user's* Postgres profile login without exposing another tool to the model.
+
+- Headers: `X-Gateway-Secret` (must equal the `GATEWAY_SECRET` env var, constant-time
+  compared; missing env var means every request is refused) and `X-Postgres-Connection`
+  (resolved exactly like MCP calls: unknown name, or missing when several connections are
+  configured, is a `400`).
+- Body: `{"sql": "<text>"}`.
+- Always executes through `SafeSqlDriver` (read-only transaction, 30 s timeout), whatever
+  `--access-mode` says.
+- `200 {"columns": [...], "rows": [{...}], "truncated": true?}`. Rows are capped at
+  `POSTGRES_MCP_MAX_ROWS` (default 10000). `Decimal` becomes a JSON number when the literal
+  round-trips exactly, otherwise a string; `datetime`/`date` become ISO 8601 UTC with `Z`;
+  `bytes` become base64.
+- `400 {"error": "<message>"}` for SQL, parse and connection errors; passwords in messages
+  are masked and configured connection names are never echoed. `401` for a bad secret.
+- Logs carry the connection name, row count and duration; never result rows.
+
 ### Schema Information
 
 The purpose of the schema information tool is to provide the calling AI agent with the information it needs to generate correct and performant SQL.
